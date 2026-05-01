@@ -28,6 +28,9 @@ async def lifespan(app: FastAPI):
 
     if pool:
         await maybe_seed_sample_data(pool)
+        if settings.aisstream_api_key:
+            asyncio.create_task(run_aisstream(pool))
+            logger.info("AISstream background task started")
 
     yield
 
@@ -84,6 +87,77 @@ async def get_terminals():
     async with pool.acquire() as conn:
         from db.queries import get_all_terminals
         return await get_all_terminals(conn)
+
+
+async def _ais_db_callback(pool: asyncpg.Pool, msg_type: str, vessel_data: dict | None, position_data: dict | None):
+    try:
+        async with pool.acquire() as conn:
+            if msg_type == "vessel" and vessel_data:
+                await conn.execute("""
+                    INSERT INTO vessels (mmsi, name, imo, flag, vessel_type, is_lng_tanker)
+                    VALUES ($1,$2,$3,$4,$5,true)
+                    ON CONFLICT (mmsi) DO UPDATE SET name=EXCLUDED.name, updated_at=NOW()
+                """, vessel_data["mmsi"], vessel_data.get("name") or "",
+                    vessel_data.get("imo") or None, vessel_data.get("flag") or None,
+                    vessel_data.get("vessel_type") or "LNG Tanker")
+
+            elif msg_type == "position" and position_data:
+                mmsi = position_data["mmsi"]
+                vessel_id = await conn.fetchval("SELECT id FROM vessels WHERE mmsi=$1", mmsi)
+                if not vessel_id:
+                    vessel_id = await conn.fetchval("""
+                        INSERT INTO vessels (mmsi, name, is_lng_tanker)
+                        VALUES ($1,$2,true) ON CONFLICT (mmsi) DO UPDATE SET mmsi=EXCLUDED.mmsi RETURNING id
+                    """, mmsi, f"LNG-{mmsi}")
+
+                await conn.execute("""
+                    INSERT INTO vessel_positions
+                        (vessel_id, mmsi, timestamp, lat, lon, speed, heading, course, nav_status, source)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'aisstream')
+                """, vessel_id, mmsi, position_data["timestamp"],
+                    position_data["lat"], position_data["lon"],
+                    position_data.get("speed"), position_data.get("heading"),
+                    position_data.get("course"), position_data.get("nav_status"))
+
+                from inference.destination_engine import run_inference
+                result = run_inference(
+                    ais_destination=position_data.get("ais_destination"),
+                    lat=position_data["lat"], lon=position_data["lon"],
+                    heading=position_data.get("heading"), speed=position_data.get("speed"),
+                )
+                active = await conn.fetchrow(
+                    "SELECT id FROM voyages WHERE vessel_id=$1 AND status='laden' ORDER BY departure_time DESC LIMIT 1",
+                    vessel_id)
+                if active:
+                    await conn.execute("""
+                        UPDATE voyages SET inferred_destination_region=$1,
+                            destination_confidence=$2, destination_explanation=$3, updated_at=NOW()
+                        WHERE id=$4
+                    """, result.region, result.confidence, result.explanation, active["id"])
+                else:
+                    await conn.execute("""
+                        INSERT INTO voyages (vessel_id, departure_time, inferred_destination_region,
+                            destination_confidence, destination_explanation, status, is_us_origin, basin)
+                        VALUES ($1,NOW(),$2,$3,$4,'laden',false,'unknown')
+                    """, vessel_id, result.region, result.confidence, result.explanation)
+    except Exception as e:
+        logger.error(f"AIS DB callback error: {e}")
+
+
+async def run_aisstream(pool: asyncpg.Pool):
+    from ingestion.aisstream_client import ingest_positions
+
+    async def callback(msg_type, vessel_data, position_data):
+        await _ais_db_callback(pool, msg_type, vessel_data, position_data)
+
+    while True:
+        try:
+            logger.info("Starting AISstream ingestion...")
+            await ingest_positions(callback, max_messages=500_000)
+        except Exception as e:
+            logger.error(f"AISstream error: {e}")
+        logger.info("AISstream reconnecting in 15s...")
+        await asyncio.sleep(15)
 
 
 async def maybe_seed_sample_data(pool: asyncpg.Pool):

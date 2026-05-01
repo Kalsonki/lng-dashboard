@@ -12,6 +12,15 @@ declare global {
   interface Window { maplibregl: typeof import("maplibre-gl") }
 }
 
+const REGION_LABEL: Record<string, string> = {
+  europe: "Europe",
+  asia: "Asia",
+  us_gulf: "US Gulf",
+  us_east: "US East",
+  mideast: "Middle East",
+  uncertain: "Uncertain",
+};
+
 export default function LNGMap({ voyages, terminals }: Props) {
   const mapRef = useRef<HTMLDivElement>(null);
   const mapInstance = useRef<import("maplibre-gl").Map | null>(null);
@@ -33,7 +42,17 @@ export default function LNGMap({ voyages, terminals }: Props) {
       mapInstance.current = map;
 
       map.on("load", () => {
-        // Add terminals as circles
+        // Route line source (shown when vessel is clicked)
+        map.addSource("route", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+        map.addLayer({
+          id: "route-line",
+          type: "line",
+          source: "route",
+          layout: { "line-join": "round", "line-cap": "round" },
+          paint: { "line-color": "#ffffff", "line-width": 2, "line-dasharray": [5, 5], "line-opacity": 0.55 },
+        });
+
+        // Terminals
         const terminalFeatures = terminals.map(t => ({
           type: "Feature" as const,
           geometry: { type: "Point" as const, coordinates: [t.lon, t.lat] },
@@ -58,7 +77,7 @@ export default function LNGMap({ voyages, terminals }: Props) {
           },
         });
 
-        // Add vessels
+        // Vessels
         const vesselFeatures = voyages
           .filter(v => v.lat !== null && v.lon !== null)
           .map(v => ({
@@ -67,7 +86,8 @@ export default function LNGMap({ voyages, terminals }: Props) {
             properties: {
               name: v.vessel_name, mmsi: v.mmsi,
               origin: v.origin_terminal_name,
-              destination: v.inferred_destination_name || v.inferred_destination_region,
+              destination_name: v.inferred_destination_name,
+              destination: v.inferred_destination_name || REGION_LABEL[v.inferred_destination_region ?? ""] || "Unknown",
               region: v.inferred_destination_region,
               speed: v.speed,
               confidence: Math.round((v.destination_confidence || 0) * 100),
@@ -81,7 +101,7 @@ export default function LNGMap({ voyages, terminals }: Props) {
           type: "circle",
           source: "vessels",
           paint: {
-            "circle-radius": 7,
+            "circle-radius": 8,
             "circle-color": ["get", "color"],
             "circle-opacity": 0.9,
             "circle-stroke-width": 2,
@@ -89,27 +109,65 @@ export default function LNGMap({ voyages, terminals }: Props) {
           },
         });
 
-        // Vessel popups
+        let activePopup: import("maplibre-gl").Popup | null = null;
+
         map.on("click", "vessels-circle", (e) => {
           const f = e.features?.[0];
           if (!f) return;
           const p = f.properties as Record<string, string | number>;
-          new maplibregl.Popup()
+          const coords = (f.geometry as unknown as { coordinates: [number, number] }).coordinates;
+
+          // Find origin and destination terminals for route line
+          const originT = terminals.find(t => t.name === p.origin);
+          const destT = terminals.find(t => t.name === p.destination_name)
+            ?? terminals.find(t => t.region === p.region && !t.is_us_export);
+
+          const routeCoords: [number, number][] = [];
+          if (originT) routeCoords.push([originT.lon, originT.lat]);
+          routeCoords.push(coords);
+          if (destT) routeCoords.push([destT.lon, destT.lat]);
+
+          (map.getSource("route") as import("maplibre-gl").GeoJSONSource).setData({
+            type: "FeatureCollection",
+            features: routeCoords.length > 1 ? [{
+              type: "Feature",
+              geometry: { type: "LineString", coordinates: routeCoords },
+              properties: {},
+            }] : [],
+          });
+
+          const regionLabel = REGION_LABEL[p.region as string] ?? p.region ?? "Unknown";
+          const destDisplay = p.destination_name || regionLabel;
+
+          activePopup?.remove();
+          activePopup = new maplibregl.Popup({ maxWidth: "300px", className: "lng-popup" })
             .setLngLat(e.lngLat)
             .setHTML(`
-              <div style="font-size:12px">
-                <strong style="font-size:13px">${p.name}</strong><br/>
-                <span style="color:#8892a4">MMSI: ${p.mmsi}</span><br/><br/>
-                <strong>Origin:</strong> ${p.origin}<br/>
-                <strong>Destination:</strong> ${p.destination}<br/>
-                <strong>Confidence:</strong> ${p.confidence}%<br/>
-                ${p.speed ? `<strong>Speed:</strong> ${Number(p.speed).toFixed(1)} kn` : ""}
+              <div style="background:#1e293b;color:#e2e8f0;font-family:sans-serif;font-size:12px;padding:2px">
+                <div style="font-size:14px;font-weight:700;margin-bottom:4px">${p.name}</div>
+                <div style="color:#64748b;margin-bottom:10px;font-size:11px">MMSI: ${p.mmsi}</div>
+                <table style="width:100%;border-collapse:collapse">
+                  <tr><td style="color:#94a3b8;padding:2px 0;width:90px">Origin</td><td style="font-weight:500">${p.origin || "Unknown"}</td></tr>
+                  <tr><td style="color:#94a3b8;padding:2px 0">Destination</td><td style="font-weight:500">${destDisplay}</td></tr>
+                  <tr><td style="color:#94a3b8;padding:2px 0">Region</td><td style="font-weight:500">${regionLabel}</td></tr>
+                  <tr><td style="color:#94a3b8;padding:2px 0">Confidence</td><td style="font-weight:500">${p.confidence}%</td></tr>
+                  ${p.speed ? `<tr><td style="color:#94a3b8;padding:2px 0">Speed</td><td style="font-weight:500">${Number(p.speed).toFixed(1)} kn</td></tr>` : ""}
+                </table>
               </div>
             `)
             .addTo(map);
         });
 
-        // Terminal popups
+        // Clear route line when map is clicked elsewhere
+        map.on("click", (e) => {
+          const features = map.queryRenderedFeatures(e.point, { layers: ["vessels-circle"] });
+          if (!features.length) {
+            (map.getSource("route") as import("maplibre-gl").GeoJSONSource).setData(
+              { type: "FeatureCollection", features: [] }
+            );
+          }
+        });
+
         map.on("click", "terminals-circle", (e) => {
           const f = e.features?.[0];
           if (!f) return;
@@ -132,7 +190,7 @@ export default function LNGMap({ voyages, terminals }: Props) {
       mapInstance.current?.remove();
       mapInstance.current = null;
     };
-  }, []);  // Only init once
+  }, []);
 
   return <div ref={mapRef} className="w-full h-full" />;
 }
