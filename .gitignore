@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.local
+analytics/.env
+frontend/.env.local
+node_modules/
+.next/
+*.egg-info/
+dist/
+build/
+.DS_Store
+pgdata/
+*.log
