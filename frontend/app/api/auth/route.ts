@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const AUTH_SECRET = process.env.AUTH_SECRET ?? "Keijo_Kojootti#64";
+const AUTH_SECRET = process.env.AUTH_SECRET ?? "Seiväsmatka";
 const COOKIE_NAME = "lng_auth";
 
 export async function POST(request: NextRequest) {
