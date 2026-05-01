@@ -126,40 +126,74 @@ export default function LNGMap({ voyages, terminals }: Props) {
           paint: { "circle-radius": 5, "circle-color": ["get", "color"], "circle-opacity": 0.85, "circle-stroke-width": 1, "circle-stroke-color": "#000" },
         });
 
-        // Vessels
-        map.addSource("vessels", {
-          type: "geojson",
-          data: {
-            type: "FeatureCollection",
-            features: voyages.filter(v => v.lat != null && v.lon != null).map(v => ({
-              type: "Feature" as const,
-              geometry: { type: "Point" as const, coordinates: [v.lon!, v.lat!] },
-              properties: {
-                name: v.vessel_name, mmsi: v.mmsi,
-                origin: v.origin_terminal_name,
-                origin_region: v.origin_region,
-                destination_name: v.inferred_destination_name,
-                destination: v.inferred_destination_name || REGION_LABEL[v.inferred_destination_region] || "Unknown",
-                region: v.inferred_destination_region,
-                confidence: Math.round((v.destination_confidence || 0) * 100),
-                speed: v.speed,
-                heading: v.heading,
-                color: destinationColor(v.inferred_destination_region),
-              },
-            })),
+        // Vessels — three visual tiers: US-origin, non-US voyage, AIS-only
+        const vesselGeoJSON = {
+          type: "FeatureCollection" as const,
+          features: voyages.filter(v => v.lat != null && v.lon != null).map(v => ({
+            type: "Feature" as const,
+            geometry: { type: "Point" as const, coordinates: [v.lon!, v.lat!] },
+            properties: {
+              name: v.vessel_name, mmsi: v.mmsi,
+              origin: v.origin_terminal_name,
+              origin_region: v.origin_region,
+              destination_name: v.inferred_destination_name,
+              destination: v.inferred_destination_name || REGION_LABEL[v.inferred_destination_region ?? ""] || "Unknown",
+              region: v.inferred_destination_region,
+              confidence: Math.round((v.destination_confidence || 0) * 100),
+              speed: v.speed,
+              heading: v.heading,
+              is_us_origin: v.is_us_origin ? 1 : 0,
+              data_source: v.data_source ?? "voyage",
+              // Color: AIS-only = gray, others by destination
+              color: v.data_source === "ais_only"
+                ? "#6b7280"
+                : destinationColor(v.inferred_destination_region),
+              radius: v.is_us_origin ? 9 : v.data_source === "ais_only" ? 5 : 7,
+              stroke: v.is_us_origin ? 3 : 1.5,
+            },
+          })),
+        };
+
+        map.addSource("vessels", { type: "geojson", data: vesselGeoJSON });
+
+        // AIS-only layer (bottom)
+        map.addLayer({
+          id: "vessels-ais", type: "circle", source: "vessels",
+          filter: ["==", ["get", "data_source"], "ais_only"],
+          paint: {
+            "circle-radius": 5, "circle-color": "#6b7280",
+            "circle-opacity": 0.7, "circle-stroke-width": 1, "circle-stroke-color": "#374151",
           },
         });
+
+        // Non-US voyage layer
         map.addLayer({
-          id: "vessels-circle", type: "circle", source: "vessels",
+          id: "vessels-other", type: "circle", source: "vessels",
+          filter: ["all", ["==", ["get", "data_source"], "voyage"], ["==", ["get", "is_us_origin"], 0]],
           paint: {
-            "circle-radius": 8, "circle-color": ["get", "color"],
-            "circle-opacity": 0.9, "circle-stroke-width": 2, "circle-stroke-color": "#fff",
+            "circle-radius": 7, "circle-color": ["get", "color"],
+            "circle-opacity": 0.75, "circle-stroke-width": 1.5, "circle-stroke-color": "#fff",
+          },
+        });
+
+        // US-origin layer (top, prominent)
+        map.addLayer({
+          id: "vessels-us", type: "circle", source: "vessels",
+          filter: ["==", ["get", "is_us_origin"], 1],
+          paint: {
+            "circle-radius": 9, "circle-color": ["get", "color"],
+            "circle-opacity": 1, "circle-stroke-width": 3, "circle-stroke-color": "#fff",
           },
         });
 
         let activePopup: import("maplibre-gl").Popup | null = null;
 
-        map.on("click", "vessels-circle", (e) => {
+        const vesselLayers = ["vessels-us", "vessels-other", "vessels-ais"];
+        map.on("click", "vessels-us", handleVesselClick);
+        map.on("click", "vessels-other", handleVesselClick);
+        map.on("click", "vessels-ais", handleVesselClick);
+
+        function handleVesselClick(e: import("maplibre-gl").MapMouseEvent & { features?: import("maplibre-gl").MapGeoJSONFeature[] }) {
           const f = e.features?.[0];
           if (!f) return;
           const p = f.properties as Record<string, string | number | null>;
@@ -187,28 +221,35 @@ export default function LNGMap({ voyages, terminals }: Props) {
           const canalNote = CANAL_WAYPOINTS[`${p.origin_region}→${p.region}`]
             ? (String(p.origin_region).startsWith("us") && p.region === "asia" ? " via Panama" : " via Suez")
             : "";
+          const isUS = p.is_us_origin === 1;
+          const isAIS = p.data_source === "ais_only";
 
           activePopup?.remove();
           activePopup = new maplibregl.Popup({ maxWidth: "300px" })
             .setLngLat(e.lngLat)
             .setHTML(`
               <div style="background:#1e293b;color:#e2e8f0;font-family:sans-serif;font-size:12px;padding:2px">
-                <div style="font-size:14px;font-weight:700;margin-bottom:4px">${p.name}</div>
+                <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+                  <div style="font-size:14px;font-weight:700">${p.name}</div>
+                  ${isUS ? '<span style="background:#1d4ed8;color:#fff;font-size:10px;padding:1px 5px;border-radius:3px">US LNG</span>' : ""}
+                  ${isAIS ? '<span style="background:#374151;color:#9ca3af;font-size:10px;padding:1px 5px;border-radius:3px">AIS only</span>' : ""}
+                </div>
                 <div style="color:#64748b;margin-bottom:10px;font-size:11px">MMSI: ${p.mmsi}</div>
                 <table style="width:100%;border-collapse:collapse">
-                  <tr><td style="color:#94a3b8;padding:3px 0;width:90px">From</td><td style="font-weight:600">${p.origin || "Unknown"}</td></tr>
-                  <tr><td style="color:#94a3b8;padding:3px 0">To</td><td style="font-weight:600">${p.destination || regionLabel}${canalNote}</td></tr>
-                  <tr><td style="color:#94a3b8;padding:3px 0">Confidence</td><td>${p.confidence}%</td></tr>
+                  ${p.origin ? `<tr><td style="color:#94a3b8;padding:3px 0;width:90px">From</td><td style="font-weight:600">${p.origin}</td></tr>` : ""}
+                  ${!isAIS ? `<tr><td style="color:#94a3b8;padding:3px 0">To</td><td style="font-weight:600">${p.destination || regionLabel}${canalNote}</td></tr>` : ""}
+                  ${p.ais_destination ? `<tr><td style="color:#94a3b8;padding:3px 0">AIS dest</td><td>${p.ais_destination}</td></tr>` : ""}
+                  ${!isAIS ? `<tr><td style="color:#94a3b8;padding:3px 0">Confidence</td><td>${p.confidence}%</td></tr>` : ""}
                   ${p.speed ? `<tr><td style="color:#94a3b8;padding:3px 0">Speed</td><td>${Number(p.speed).toFixed(1)} kn</td></tr>` : ""}
                   ${p.heading != null ? `<tr><td style="color:#94a3b8;padding:3px 0">Heading</td><td>${p.heading}°</td></tr>` : ""}
                 </table>
               </div>
             `)
             .addTo(map);
-        });
+        }
 
         map.on("click", (e) => {
-          if (!map.queryRenderedFeatures(e.point, { layers: ["vessels-circle"] }).length) {
+          if (!map.queryRenderedFeatures(e.point, { layers: vesselLayers }).length) {
             (map.getSource("route") as import("maplibre-gl").GeoJSONSource).setData(
               { type: "FeatureCollection", features: [] }
             );
@@ -225,8 +266,10 @@ export default function LNGMap({ voyages, terminals }: Props) {
             .addTo(map);
         });
 
-        map.on("mouseenter", "vessels-circle", () => { map.getCanvas().style.cursor = "pointer"; });
-        map.on("mouseleave", "vessels-circle", () => { map.getCanvas().style.cursor = ""; });
+        for (const layer of vesselLayers) {
+          map.on("mouseenter", layer, () => { map.getCanvas().style.cursor = "pointer"; });
+          map.on("mouseleave", layer, () => { map.getCanvas().style.cursor = ""; });
+        }
         map.on("mouseenter", "terminals-circle", () => { map.getCanvas().style.cursor = "pointer"; });
         map.on("mouseleave", "terminals-circle", () => { map.getCanvas().style.cursor = ""; });
       });

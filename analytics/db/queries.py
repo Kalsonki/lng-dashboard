@@ -121,6 +121,56 @@ async def get_us_flow_split(conn, days: int = 30) -> dict:
     }
 
 
+async def get_all_lng_vessels_map(conn) -> list[dict]:
+    """All LNG vessels with positions: active voyages + AIS-only vessels."""
+    return await fetch_all(conn, """
+        SELECT v.id, v.vessel_id, vs.name as vessel_name, vs.mmsi, vs.flag,
+               vs.cargo_capacity_m3,
+               v.origin_terminal_name, v.origin_region, v.departure_time,
+               v.inferred_destination_region, v.inferred_destination_name,
+               v.destination_confidence, v.destination_explanation,
+               v.status, v.basin, v.is_us_origin,
+               p.lat, p.lon, p.speed, p.heading, p.ais_destination,
+               p.timestamp as last_position_time,
+               'voyage' as data_source
+        FROM voyages v
+        JOIN vessels vs ON vs.id = v.vessel_id
+        JOIN LATERAL (
+            SELECT lat, lon, speed, heading, ais_destination, timestamp
+            FROM vessel_positions vp
+            WHERE vp.vessel_id = v.vessel_id
+            ORDER BY timestamp DESC LIMIT 1
+        ) p ON true
+        WHERE v.status IN ('laden', 'loading', 'unknown')
+          AND v.departure_time > NOW() - INTERVAL '45 days'
+
+        UNION ALL
+
+        SELECT -1 as id, vs.id as vessel_id, vs.name as vessel_name, vs.mmsi, vs.flag,
+               vs.cargo_capacity_m3,
+               NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+               'unknown', 'unknown', false as is_us_origin,
+               p.lat, p.lon, p.speed, p.heading, p.ais_destination,
+               p.timestamp as last_position_time,
+               'ais_only' as data_source
+        FROM vessels vs
+        JOIN LATERAL (
+            SELECT lat, lon, speed, heading, ais_destination, timestamp
+            FROM vessel_positions vp
+            WHERE vp.vessel_id = vs.id
+              AND vp.timestamp > NOW() - INTERVAL '24 hours'
+            ORDER BY timestamp DESC LIMIT 1
+        ) p ON true
+        WHERE vs.is_lng_tanker = true
+          AND vs.id NOT IN (
+              SELECT vessel_id FROM voyages
+              WHERE status IN ('laden', 'loading', 'unknown')
+                AND departure_time > NOW() - INTERVAL '45 days'
+          )
+        ORDER BY last_position_time DESC
+    """)
+
+
 async def get_all_terminals(conn) -> list[dict]:
     return await fetch_all(conn, """
         SELECT id, name, short_code, country, region, basin, terminal_type,

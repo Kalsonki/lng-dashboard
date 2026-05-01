@@ -100,6 +100,7 @@ export interface Voyage {
   heading: number | null;
   ais_destination: string | null;
   last_position_time: string | null;
+  data_source?: "voyage" | "ais_only";
 }
 
 export interface Terminal {
