@@ -8,18 +8,73 @@ interface Props {
   terminals: Terminal[];
 }
 
-declare global {
-  interface Window { maplibregl: typeof import("maplibre-gl") }
+const REGION_LABEL: Record<string, string> = {
+  europe: "Europe", asia: "Asia", us_gulf: "US Gulf",
+  us_east: "US East", mideast: "Middle East", uncertain: "Uncertain",
+};
+
+// Waypoints vessels must pass through on specific routes
+const CANAL_WAYPOINTS: Record<string, [number, number][]> = {
+  "us_gulf→europe":  [[-60, 30], [-20, 38]],
+  "us_east→europe":  [[-40, 42]],
+  "us_gulf→asia":    [[-85, 10], [-79.9, 9.1], [-100, 15], [-140, 20]],  // Panama
+  "us_east→asia":    [[-79.9, 9.1], [-120, 10]],                          // Panama
+  "mideast→europe":  [[55, 15], [43, 13], [32.5, 30.5], [28, 34]],        // Suez
+  "mideast→asia":    [[60, 15]],
+  "asia→europe":     [[100, 5], [80, 8], [60, 12], [43, 13], [32.5, 30.5]], // Suez
+};
+
+function findTerminal(terminals: Terminal[], name: string | number | null | undefined): Terminal | undefined {
+  if (!name) return undefined;
+  const n = String(name).toLowerCase().trim();
+  return terminals.find(t => t.name.toLowerCase() === n)
+    ?? terminals.find(t => t.name.toLowerCase().includes(n) || n.includes(t.name.toLowerCase()));
 }
 
-const REGION_LABEL: Record<string, string> = {
-  europe: "Europe",
-  asia: "Asia",
-  us_gulf: "US Gulf",
-  us_east: "US East",
-  mideast: "Middle East",
-  uncertain: "Uncertain",
-};
+function greatCircleArc(from: [number, number], to: [number, number], steps = 50): [number, number][] {
+  const R = Math.PI / 180;
+  const [ln1, lt1] = [from[0] * R, from[1] * R];
+  const [ln2, lt2] = [to[0] * R, to[1] * R];
+  const d = 2 * Math.asin(Math.sqrt(
+    Math.sin((lt2 - lt1) / 2) ** 2 +
+    Math.cos(lt1) * Math.cos(lt2) * Math.sin((ln2 - ln1) / 2) ** 2
+  ));
+  if (d < 0.001) return [from, to];
+  const pts: [number, number][] = [];
+  for (let i = 0; i <= steps; i++) {
+    const f = i / steps;
+    const A = Math.sin((1 - f) * d) / Math.sin(d);
+    const B = Math.sin(f * d) / Math.sin(d);
+    const x = A * Math.cos(lt1) * Math.cos(ln1) + B * Math.cos(lt2) * Math.cos(ln2);
+    const y = A * Math.cos(lt1) * Math.sin(ln1) + B * Math.cos(lt2) * Math.sin(ln2);
+    const z = A * Math.sin(lt1) + B * Math.sin(lt2);
+    pts.push([Math.atan2(y, x) / R, Math.atan2(z, Math.sqrt(x * x + y * y)) / R]);
+  }
+  return pts;
+}
+
+function buildRoute(
+  originT: Terminal | undefined,
+  destT: Terminal | undefined,
+  originRegion: string,
+  destRegion: string,
+): [number, number][] {
+  if (!originT || !destT) return [];
+  const key = `${originRegion}→${destRegion}`;
+  const waypoints: [number, number][] = CANAL_WAYPOINTS[key] ?? [];
+  const nodes: [number, number][] = [
+    [originT.lon, originT.lat],
+    ...waypoints,
+    [destT.lon, destT.lat],
+  ];
+  const route: [number, number][] = [];
+  for (let i = 0; i < nodes.length - 1; i++) {
+    const seg = greatCircleArc(nodes[i], nodes[i + 1], 40);
+    if (i > 0) seg.shift();
+    route.push(...seg);
+  }
+  return route;
+}
 
 export default function LNGMap({ voyages, terminals }: Props) {
   const mapRef = useRef<HTMLDivElement>(null);
@@ -38,74 +93,67 @@ export default function LNGMap({ voyages, terminals }: Props) {
         center: [0, 25],
         zoom: 2,
       });
-
       mapInstance.current = map;
 
       map.on("load", () => {
-        // Route line source (shown when vessel is clicked)
+        // Route line
         map.addSource("route", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
         map.addLayer({
           id: "route-line",
           type: "line",
           source: "route",
           layout: { "line-join": "round", "line-cap": "round" },
-          paint: { "line-color": "#ffffff", "line-width": 2, "line-dasharray": [5, 5], "line-opacity": 0.55 },
+          paint: { "line-color": "#ffffff", "line-width": 2, "line-dasharray": [6, 4], "line-opacity": 0.5 },
         });
 
         // Terminals
-        const terminalFeatures = terminals.map(t => ({
-          type: "Feature" as const,
-          geometry: { type: "Point" as const, coordinates: [t.lon, t.lat] },
-          properties: {
-            name: t.name, type: t.terminal_type, region: t.region,
-            is_us_export: t.is_us_export,
-            color: t.is_us_export ? "#06b6d4" : (t.region === "europe" ? "#22c55e" : "#f59e0b"),
+        map.addSource("terminals", {
+          type: "geojson",
+          data: {
+            type: "FeatureCollection",
+            features: terminals.map(t => ({
+              type: "Feature" as const,
+              geometry: { type: "Point" as const, coordinates: [t.lon, t.lat] },
+              properties: {
+                name: t.name, type: t.terminal_type, region: t.region,
+                color: t.is_us_export ? "#06b6d4" : t.region === "europe" ? "#22c55e" : "#f59e0b",
+              },
+            })),
           },
-        }));
-
-        map.addSource("terminals", { type: "geojson", data: { type: "FeatureCollection", features: terminalFeatures } });
+        });
         map.addLayer({
-          id: "terminals-circle",
-          type: "circle",
-          source: "terminals",
-          paint: {
-            "circle-radius": 5,
-            "circle-color": ["get", "color"],
-            "circle-opacity": 0.85,
-            "circle-stroke-width": 1,
-            "circle-stroke-color": "#000",
-          },
+          id: "terminals-circle", type: "circle", source: "terminals",
+          paint: { "circle-radius": 5, "circle-color": ["get", "color"], "circle-opacity": 0.85, "circle-stroke-width": 1, "circle-stroke-color": "#000" },
         });
 
         // Vessels
-        const vesselFeatures = voyages
-          .filter(v => v.lat !== null && v.lon !== null)
-          .map(v => ({
-            type: "Feature" as const,
-            geometry: { type: "Point" as const, coordinates: [v.lon!, v.lat!] },
-            properties: {
-              name: v.vessel_name, mmsi: v.mmsi,
-              origin: v.origin_terminal_name,
-              destination_name: v.inferred_destination_name,
-              destination: v.inferred_destination_name || REGION_LABEL[v.inferred_destination_region ?? ""] || "Unknown",
-              region: v.inferred_destination_region,
-              speed: v.speed,
-              confidence: Math.round((v.destination_confidence || 0) * 100),
-              color: destinationColor(v.inferred_destination_region),
-            },
-          }));
-
-        map.addSource("vessels", { type: "geojson", data: { type: "FeatureCollection", features: vesselFeatures } });
+        map.addSource("vessels", {
+          type: "geojson",
+          data: {
+            type: "FeatureCollection",
+            features: voyages.filter(v => v.lat != null && v.lon != null).map(v => ({
+              type: "Feature" as const,
+              geometry: { type: "Point" as const, coordinates: [v.lon!, v.lat!] },
+              properties: {
+                name: v.vessel_name, mmsi: v.mmsi,
+                origin: v.origin_terminal_name,
+                origin_region: v.origin_region,
+                destination_name: v.inferred_destination_name,
+                destination: v.inferred_destination_name || REGION_LABEL[v.inferred_destination_region] || "Unknown",
+                region: v.inferred_destination_region,
+                confidence: Math.round((v.destination_confidence || 0) * 100),
+                speed: v.speed,
+                heading: v.heading,
+                color: destinationColor(v.inferred_destination_region),
+              },
+            })),
+          },
+        });
         map.addLayer({
-          id: "vessels-circle",
-          type: "circle",
-          source: "vessels",
+          id: "vessels-circle", type: "circle", source: "vessels",
           paint: {
-            "circle-radius": 8,
-            "circle-color": ["get", "color"],
-            "circle-opacity": 0.9,
-            "circle-stroke-width": 2,
-            "circle-stroke-color": "#fff",
+            "circle-radius": 8, "circle-color": ["get", "color"],
+            "circle-opacity": 0.9, "circle-stroke-width": 2, "circle-stroke-color": "#fff",
           },
         });
 
@@ -114,18 +162,17 @@ export default function LNGMap({ voyages, terminals }: Props) {
         map.on("click", "vessels-circle", (e) => {
           const f = e.features?.[0];
           if (!f) return;
-          const p = f.properties as Record<string, string | number>;
-          const coords = (f.geometry as unknown as { coordinates: [number, number] }).coordinates;
+          const p = f.properties as Record<string, string | number | null>;
 
-          // Find origin and destination terminals for route line
-          const originT = terminals.find(t => t.name === p.origin);
-          const destT = terminals.find(t => t.name === p.destination_name)
-            ?? terminals.find(t => t.region === p.region && !t.is_us_export);
+          const originT = findTerminal(terminals, p.origin)
+            ?? terminals.find(t => t.region === p.origin_region && t.is_us_export);
+          const destT = findTerminal(terminals, p.destination_name)
+            ?? terminals.find(t => t.region === String(p.region) && !t.is_us_export);
 
-          const routeCoords: [number, number][] = [];
-          if (originT) routeCoords.push([originT.lon, originT.lat]);
-          routeCoords.push(coords);
-          if (destT) routeCoords.push([destT.lon, destT.lat]);
+          const routeCoords = buildRoute(
+            originT, destT,
+            String(p.origin_region || ""), String(p.region || "")
+          );
 
           (map.getSource("route") as import("maplibre-gl").GeoJSONSource).setData({
             type: "FeatureCollection",
@@ -136,32 +183,32 @@ export default function LNGMap({ voyages, terminals }: Props) {
             }] : [],
           });
 
-          const regionLabel = REGION_LABEL[p.region as string] ?? p.region ?? "Unknown";
-          const destDisplay = p.destination_name || regionLabel;
+          const regionLabel = REGION_LABEL[String(p.region)] ?? String(p.region) ?? "Unknown";
+          const canalNote = CANAL_WAYPOINTS[`${p.origin_region}→${p.region}`]
+            ? (String(p.origin_region).startsWith("us") && p.region === "asia" ? " via Panama" : " via Suez")
+            : "";
 
           activePopup?.remove();
-          activePopup = new maplibregl.Popup({ maxWidth: "300px", className: "lng-popup" })
+          activePopup = new maplibregl.Popup({ maxWidth: "300px" })
             .setLngLat(e.lngLat)
             .setHTML(`
               <div style="background:#1e293b;color:#e2e8f0;font-family:sans-serif;font-size:12px;padding:2px">
                 <div style="font-size:14px;font-weight:700;margin-bottom:4px">${p.name}</div>
                 <div style="color:#64748b;margin-bottom:10px;font-size:11px">MMSI: ${p.mmsi}</div>
                 <table style="width:100%;border-collapse:collapse">
-                  <tr><td style="color:#94a3b8;padding:2px 0;width:90px">Origin</td><td style="font-weight:500">${p.origin || "Unknown"}</td></tr>
-                  <tr><td style="color:#94a3b8;padding:2px 0">Destination</td><td style="font-weight:500">${destDisplay}</td></tr>
-                  <tr><td style="color:#94a3b8;padding:2px 0">Region</td><td style="font-weight:500">${regionLabel}</td></tr>
-                  <tr><td style="color:#94a3b8;padding:2px 0">Confidence</td><td style="font-weight:500">${p.confidence}%</td></tr>
-                  ${p.speed ? `<tr><td style="color:#94a3b8;padding:2px 0">Speed</td><td style="font-weight:500">${Number(p.speed).toFixed(1)} kn</td></tr>` : ""}
+                  <tr><td style="color:#94a3b8;padding:3px 0;width:90px">From</td><td style="font-weight:600">${p.origin || "Unknown"}</td></tr>
+                  <tr><td style="color:#94a3b8;padding:3px 0">To</td><td style="font-weight:600">${p.destination || regionLabel}${canalNote}</td></tr>
+                  <tr><td style="color:#94a3b8;padding:3px 0">Confidence</td><td>${p.confidence}%</td></tr>
+                  ${p.speed ? `<tr><td style="color:#94a3b8;padding:3px 0">Speed</td><td>${Number(p.speed).toFixed(1)} kn</td></tr>` : ""}
+                  ${p.heading != null ? `<tr><td style="color:#94a3b8;padding:3px 0">Heading</td><td>${p.heading}°</td></tr>` : ""}
                 </table>
               </div>
             `)
             .addTo(map);
         });
 
-        // Clear route line when map is clicked elsewhere
         map.on("click", (e) => {
-          const features = map.queryRenderedFeatures(e.point, { layers: ["vessels-circle"] });
-          if (!features.length) {
+          if (!map.queryRenderedFeatures(e.point, { layers: ["vessels-circle"] }).length) {
             (map.getSource("route") as import("maplibre-gl").GeoJSONSource).setData(
               { type: "FeatureCollection", features: [] }
             );
@@ -186,10 +233,7 @@ export default function LNGMap({ voyages, terminals }: Props) {
     };
 
     initMap();
-    return () => {
-      mapInstance.current?.remove();
-      mapInstance.current = null;
-    };
+    return () => { mapInstance.current?.remove(); mapInstance.current = null; };
   }, []);
 
   return <div ref={mapRef} className="w-full h-full" />;
