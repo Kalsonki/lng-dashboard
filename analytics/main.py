@@ -20,7 +20,7 @@ async def lifespan(app: FastAPI):
     pool = None
     dsn = settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
     try:
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=10, timeout=10, command_timeout=10)
+        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=10, timeout=15, command_timeout=15, ssl="require")
         set_pool(pool)
         logger.info("Database pool connected")
     except Exception as e:
