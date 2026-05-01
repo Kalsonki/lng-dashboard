@@ -1,5 +1,5 @@
 "use client";
-import { useRef, useEffect } from "react";
+import { useRef, useEffect, useState, useCallback } from "react";
 import type { Voyage, Terminal } from "@/lib/types";
 import { destinationColor } from "@/lib/utils";
 
@@ -8,20 +8,35 @@ interface Props {
   terminals: Terminal[];
 }
 
+type SizeFilter = "all" | "small" | "medium" | "large";
+
+function sizeCat(m3: number | null | undefined): string {
+  if (m3 == null) return "unknown";
+  if (m3 < 100_000) return "small";
+  if (m3 <= 175_000) return "medium";
+  return "large";
+}
+
+const SIZE_LABELS: Record<SizeFilter, string> = {
+  all: "All sizes",
+  small: "< 100k m³",
+  medium: "100–175k m³",
+  large: "> 175k m³",
+};
+
 const REGION_LABEL: Record<string, string> = {
   europe: "Europe", asia: "Asia", us_gulf: "US Gulf",
   us_east: "US East", mideast: "Middle East", uncertain: "Uncertain",
 };
 
-// Waypoints vessels must pass through on specific routes
 const CANAL_WAYPOINTS: Record<string, [number, number][]> = {
   "us_gulf→europe":  [[-60, 30], [-20, 38]],
   "us_east→europe":  [[-40, 42]],
-  "us_gulf→asia":    [[-85, 10], [-79.9, 9.1], [-100, 15], [-140, 20]],  // Panama
-  "us_east→asia":    [[-79.9, 9.1], [-120, 10]],                          // Panama
-  "mideast→europe":  [[55, 15], [43, 13], [32.5, 30.5], [28, 34]],        // Suez
+  "us_gulf→asia":    [[-85, 10], [-79.9, 9.1], [-100, 15], [-140, 20]],
+  "us_east→asia":    [[-79.9, 9.1], [-120, 10]],
+  "mideast→europe":  [[55, 15], [43, 13], [32.5, 30.5], [28, 34]],
   "mideast→asia":    [[60, 15]],
-  "asia→europe":     [[100, 5], [80, 8], [60, 12], [43, 13], [32.5, 30.5]], // Suez
+  "asia→europe":     [[100, 5], [80, 8], [60, 12], [43, 13], [32.5, 30.5]],
 };
 
 function findTerminal(terminals: Terminal[], name: string | number | null | undefined): Terminal | undefined {
@@ -76,9 +91,38 @@ function buildRoute(
   return route;
 }
 
+// Build MapLibre filter expression combining layer base filter with size category
+function makeFilter(base: unknown[], cats: string[]): unknown[] {
+  if (cats.length === 0) return ["==", "1", "0"]; // hide all
+  const sizeExpr: unknown[] = ["in", ["get", "size_cat"], ["literal", cats]];
+  return ["all", ...base.slice(1), sizeExpr];
+}
+
+const BASE_FILTERS = {
+  "vessels-ais":   ["==", ["get", "data_source"], "ais_only"],
+  "vessels-other": ["all", ["==", ["get", "data_source"], "voyage"], ["==", ["get", "is_us_origin"], 0]],
+  "vessels-us":    ["all", ["==", ["get", "is_us_origin"], 1]],
+} as const;
+
 export default function LNGMap({ voyages, terminals }: Props) {
   const mapRef = useRef<HTMLDivElement>(null);
   const mapInstance = useRef<import("maplibre-gl").Map | null>(null);
+  const [sizeFilter, setSizeFilter] = useState<SizeFilter>("all");
+  const [mapReady, setMapReady] = useState(false);
+
+  const applyFilter = useCallback((sf: SizeFilter) => {
+    const map = mapInstance.current;
+    if (!map) return;
+    const cats = sf === "all" ? ["small", "medium", "large", "unknown"] : [sf, "unknown"];
+    for (const [layer, base] of Object.entries(BASE_FILTERS)) {
+      map.setFilter(layer, makeFilter([...base] as unknown[], cats) as never);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!mapReady) return;
+    applyFilter(sizeFilter);
+  }, [sizeFilter, mapReady, applyFilter]);
 
   useEffect(() => {
     if (!mapRef.current || mapInstance.current) return;
@@ -96,7 +140,6 @@ export default function LNGMap({ voyages, terminals }: Props) {
       mapInstance.current = map;
 
       map.on("load", () => {
-        // Route line
         map.addSource("route", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
         map.addLayer({
           id: "route-line",
@@ -106,7 +149,6 @@ export default function LNGMap({ voyages, terminals }: Props) {
           paint: { "line-color": "#ffffff", "line-width": 2, "line-dasharray": [6, 4], "line-opacity": 0.5 },
         });
 
-        // Terminals
         map.addSource("terminals", {
           type: "geojson",
           data: {
@@ -126,7 +168,6 @@ export default function LNGMap({ voyages, terminals }: Props) {
           paint: { "circle-radius": 5, "circle-color": ["get", "color"], "circle-opacity": 0.85, "circle-stroke-width": 1, "circle-stroke-color": "#000" },
         });
 
-        // Vessels — three visual tiers: US-origin, non-US voyage, AIS-only
         const vesselGeoJSON = {
           type: "FeatureCollection" as const,
           features: voyages.filter(v => v.lat != null && v.lon != null).map(v => ({
@@ -142,21 +183,19 @@ export default function LNGMap({ voyages, terminals }: Props) {
               confidence: Math.round((v.destination_confidence || 0) * 100),
               speed: v.speed,
               heading: v.heading,
+              capacity: v.cargo_capacity_m3,
+              size_cat: sizeCat(v.cargo_capacity_m3),
               is_us_origin: v.is_us_origin ? 1 : 0,
               data_source: v.data_source ?? "voyage",
-              // Color: AIS-only = gray, others by destination
               color: v.data_source === "ais_only"
                 ? "#6b7280"
                 : destinationColor(v.inferred_destination_region),
-              radius: v.is_us_origin ? 9 : v.data_source === "ais_only" ? 5 : 7,
-              stroke: v.is_us_origin ? 3 : 1.5,
             },
           })),
         };
 
         map.addSource("vessels", { type: "geojson", data: vesselGeoJSON });
 
-        // AIS-only layer (bottom)
         map.addLayer({
           id: "vessels-ais", type: "circle", source: "vessels",
           filter: ["==", ["get", "data_source"], "ais_only"],
@@ -166,7 +205,6 @@ export default function LNGMap({ voyages, terminals }: Props) {
           },
         });
 
-        // Non-US voyage layer
         map.addLayer({
           id: "vessels-other", type: "circle", source: "vessels",
           filter: ["all", ["==", ["get", "data_source"], "voyage"], ["==", ["get", "is_us_origin"], 0]],
@@ -176,7 +214,6 @@ export default function LNGMap({ voyages, terminals }: Props) {
           },
         });
 
-        // US-origin layer (top, prominent)
         map.addLayer({
           id: "vessels-us", type: "circle", source: "vessels",
           filter: ["==", ["get", "is_us_origin"], 1],
@@ -187,8 +224,8 @@ export default function LNGMap({ voyages, terminals }: Props) {
         });
 
         let activePopup: import("maplibre-gl").Popup | null = null;
-
         const vesselLayers = ["vessels-us", "vessels-other", "vessels-ais"];
+
         map.on("click", "vessels-us", handleVesselClick);
         map.on("click", "vessels-other", handleVesselClick);
         map.on("click", "vessels-ais", handleVesselClick);
@@ -223,6 +260,7 @@ export default function LNGMap({ voyages, terminals }: Props) {
             : "";
           const isUS = p.is_us_origin === 1;
           const isAIS = p.data_source === "ais_only";
+          const capStr = p.capacity ? `${Math.round(Number(p.capacity) / 1000)}k m³` : null;
 
           activePopup?.remove();
           activePopup = new maplibregl.Popup({ maxWidth: "300px" })
@@ -240,6 +278,7 @@ export default function LNGMap({ voyages, terminals }: Props) {
                   ${!isAIS ? `<tr><td style="color:#94a3b8;padding:3px 0">To</td><td style="font-weight:600">${p.destination || regionLabel}${canalNote}</td></tr>` : ""}
                   ${p.ais_destination ? `<tr><td style="color:#94a3b8;padding:3px 0">AIS dest</td><td>${p.ais_destination}</td></tr>` : ""}
                   ${!isAIS ? `<tr><td style="color:#94a3b8;padding:3px 0">Confidence</td><td>${p.confidence}%</td></tr>` : ""}
+                  ${capStr ? `<tr><td style="color:#94a3b8;padding:3px 0">Capacity</td><td>${capStr}</td></tr>` : ""}
                   ${p.speed ? `<tr><td style="color:#94a3b8;padding:3px 0">Speed</td><td>${Number(p.speed).toFixed(1)} kn</td></tr>` : ""}
                   ${p.heading != null ? `<tr><td style="color:#94a3b8;padding:3px 0">Heading</td><td>${p.heading}°</td></tr>` : ""}
                 </table>
@@ -272,6 +311,8 @@ export default function LNGMap({ voyages, terminals }: Props) {
         }
         map.on("mouseenter", "terminals-circle", () => { map.getCanvas().style.cursor = "pointer"; });
         map.on("mouseleave", "terminals-circle", () => { map.getCanvas().style.cursor = ""; });
+
+        setMapReady(true);
       });
     };
 
@@ -279,5 +320,26 @@ export default function LNGMap({ voyages, terminals }: Props) {
     return () => { mapInstance.current?.remove(); mapInstance.current = null; };
   }, []);
 
-  return <div ref={mapRef} className="w-full h-full" />;
+  return (
+    <div className="relative w-full h-full">
+      <div ref={mapRef} className="w-full h-full" />
+      {mapReady && (
+        <div className="absolute top-2 right-2 flex gap-1 bg-slate-900/90 backdrop-blur rounded-md p-1 border border-slate-700">
+          {(["all", "small", "medium", "large"] as SizeFilter[]).map(sz => (
+            <button
+              key={sz}
+              onClick={() => setSizeFilter(sz)}
+              className={`px-2.5 py-1 text-xs rounded transition-colors ${
+                sizeFilter === sz
+                  ? "bg-blue-600 text-white"
+                  : "text-slate-400 hover:text-slate-200 hover:bg-slate-700"
+              }`}
+            >
+              {SIZE_LABELS[sz]}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
