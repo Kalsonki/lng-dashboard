@@ -20,7 +20,7 @@ async def lifespan(app: FastAPI):
     pool = None
     dsn = settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
     try:
-        pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
+        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=10, timeout=10, command_timeout=10)
         set_pool(pool)
         logger.info("Database pool connected")
     except Exception as e:
@@ -44,7 +44,12 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://lng-dashboard.vercel.app",
+        "https://lng-dashboard-*.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
